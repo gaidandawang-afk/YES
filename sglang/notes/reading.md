@@ -756,3 +756,293 @@ chunked_req = 当前那个“prompt 还没 prefill 完、下一轮还要继续 e
    self.chunked_req = adder.add_chunked_req(self.chunked_req)
    返回 req 表示还没完，返回 None 表示最后一段处理完
 ```
+## 14. `ModelRunner` 在哪里初始化通信域
+
+SRT LLM 推理主线里，通信域初始化发生在 `ModelRunner.__init__()` 调用的 `init_torch_distributed()` 中。
+
+主链路：
+
+```text
+TpModelWorker.__init__
+  -> ModelRunner.__init__
+  -> ModelRunner.init_torch_distributed()
+  -> init_distributed_environment()
+  -> initialize_model_parallel()
+  -> initialize_dp_attention()
+```
+
+关键位置：
+
+- `ModelRunner.__init__`：[model_runner.py](M:/Codes/sglang-ft/sglang/python/sglang/srt/model_executor/model_runner.py:288)
+- `init_torch_distributed` 内调用分布式初始化：[model_runner.py](M:/Codes/sglang-ft/sglang/python/sglang/srt/model_executor/model_runner.py:899)
+- `init_distributed_environment`：[parallel_state.py](M:/Codes/sglang-ft/sglang/python/sglang/srt/distributed/parallel_state.py:1675)
+- `initialize_model_parallel`：[parallel_state.py](M:/Codes/sglang-ft/sglang/python/sglang/srt/distributed/parallel_state.py:1749)
+
+### 14.1 `init_distributed_environment()` 做什么
+
+它先初始化 PyTorch 的默认 distributed world：
+
+```python
+torch.distributed.init_process_group(...)
+```
+
+`ModelRunner` 传入的 rank 关系是：
+
+```python
+world_size = self.tp_size * self.pp_size
+rank = self.tp_size * self.pp_rank + self.tp_rank
+local_rank = self.gpu_id
+```
+
+所以在一个 SRT model worker group 内：
+
+```text
+torch distributed world = TP * PP
+```
+
+普通 DP 多副本通常不是放在同一个 `ModelRunner` world 里；`enable_dp_attention` 则是在同一个 global TP 内重新解释 attention/MoE 的并行维度。
+
+### 14.2 `initialize_model_parallel()` 做什么
+
+这里才真正创建 SRT LLM 推理中的模型并行通信域：
+
+```text
+_TP       tensor parallel group
+_ATTN_CP  attention context parallel group
+_ATTN_TP  attention tensor parallel group
+_MOE_DP   MoE data parallel group
+_MOE_EP   MoE expert parallel group
+_MOE_TP   MoE tensor parallel group
+_PP       pipeline parallel group
+```
+
+`ModelRunner` 传入：
+
+```python
+initialize_model_parallel(
+    tensor_model_parallel_size=self.tp_size,
+    attention_data_parallel_size=self.dp_size,
+    pipeline_model_parallel_size=self.pp_size,
+    expert_model_parallel_size=self.moe_ep_size,
+    attention_context_model_parallel_size=self.attn_cp_size,
+    moe_data_model_parallel_size=self.moe_dp_size,
+)
+```
+
+所以通信域 rank list 的构造逻辑不在 `ModelRunner` 里，而在 `srt/distributed/parallel_state.py`。
+
+### 14.3 `initialize_dp_attention()` 做什么
+
+`initialize_dp_attention()` 名字容易误解。它主要不是创建 `ProcessGroup`，而是初始化 attention-DP 相关的全局元信息：
+
+```text
+_ATTN_DP_RANK
+_ATTN_DP_SIZE
+_LOCAL_ATTN_DP_RANK
+_LOCAL_ATTN_DP_SIZE
+hidden_size / dtype / device
+```
+
+真正的 `attention_tp_group` / `attention_cp_group` 已经在 `initialize_model_parallel()` 里创建。
+
+### 14.4 ModelRunner 后续如何拿 group
+
+初始化完成后，`ModelRunner` 保存几个常用 group：
+
+```python
+self.tp_group = get_tp_group()
+self.pp_group = get_pp_group()
+self.attention_tp_group = get_attention_tp_group()
+```
+
+位置：[model_runner.py](M:/Codes/sglang-ft/sglang/python/sglang/srt/model_executor/model_runner.py:949)
+
+后续 attention、MoE、all-reduce、all-gather 通过 `get_tp_group()`、`get_attn_tp_group()`、`get_moe_ep_group()` 等函数拿到对应通信域。
+
+一句话：
+
+```text
+ModelRunner 负责触发通信域初始化；真正创建 TP/PP/ATTN/MOE groups 的代码在 parallel_state.py。
+```
+
+## 15. `_WORLD` 和 `GroupCoordinator.world_size` 的区别
+
+`_WORLD` 是模块级全局变量：
+
+```python
+_WORLD: Optional[GroupCoordinator] = None
+```
+
+它保存的是“全局 WORLD 通信域”的 `GroupCoordinator` 对象。
+
+初始化逻辑：
+
+```python
+if _WORLD is None:
+    ranks = list(range(torch.distributed.get_world_size()))
+    _WORLD = init_world_group(ranks, local_rank, backend)
+```
+
+所以：
+
+```text
+_WORLD = 当前进程看到的整个 torch distributed world 的 GroupCoordinator 包装
+```
+
+`GroupCoordinator.world_size` 则是某一个通信组内部的大小。`GroupCoordinator` 可以包装 WORLD，也可以包装 TP、PP、ATTN_TP、MOE_EP 等子组。
+
+构造时：
+
+```python
+if self.rank in ranks:
+    self.ranks = ranks
+    self.world_size = len(ranks)
+    self.rank_in_group = ranks.index(self.rank)
+    self.device_group = device_group
+    self.cpu_group = cpu_group
+```
+
+所以：
+
+```text
+_WORLD.world_size = 全局 world 大小
+_TP.world_size = 当前 TP group 大小
+_PP.world_size = 当前 PP group 大小
+_MOE_EP.world_size = 当前 MoE EP group 大小
+```
+
+例子，8 卡，TP=4，PP=2：
+
+```text
+_WORLD.world_size = 8
+
+rank 0 所在 _TP group = [0, 1, 2, 3]
+_TP.world_size = 4
+
+rank 0 所在 _PP group = [0, 4]
+_PP.world_size = 2
+```
+
+`torch.distributed` 的默认 WORLD 和 SGLang `_WORLD` 也要区分：
+
+```text
+torch.distributed WORLD:
+  PyTorch init_process_group 创建的默认进程组
+
+SGLang _WORLD:
+  用 GroupCoordinator 包装后的全局通信域，额外带 cpu_group/device_group/rank 映射/通信 helper
+```
+
+一句话：
+
+```text
+_WORLD 是“全局通信域这个对象”的全局句柄；world_size 是“某个通信域里有多少 rank”的属性。
+```
+
+## 16. `_SP/_CFG/_DIT/_VAE` 和 `multimodal_gen` 的关系
+
+最近看到的这组变量：
+
+```python
+_WORLD: GroupCoordinator | None = None
+_TP: GroupCoordinator | None = None
+_SP: SequenceParallelGroupCoordinator | None = None
+_PP: PipelineGroupCoordinator | None = None
+_CFG: GroupCoordinator | None = None
+_DP: GroupCoordinator | None = None
+_DIT: ProcessGroup | None = None
+_VAE: ProcessGroup | None = None
+```
+
+不是 SRT LLM runtime 的通信域变量，而是 diffusion / multimodal generation runtime 里的并行状态，文件在：
+
+[parallel_state.py](M:/Codes/sglang-ft/sglang/python/sglang/multimodal_gen/runtime/distributed/parallel_state.py:64)
+
+之所以会提到 `multimodal_gen`，是因为 `_SP/_CFG/_DIT/_VAE` 这些名字没有出现在 SRT LLM 的 `python/sglang/srt/distributed/parallel_state.py` 中；它们属于 `sglang.multimodal_gen.runtime.distributed.parallel_state`。
+
+### 16.1 SRT LLM runtime 里主要是这些 group
+
+SRT LLM 推理主线，也就是前面一直看的 `Scheduler -> TpModelWorker -> ModelRunner`，主要 group 是：
+
+```text
+_WORLD
+_TP
+_ATTN_TP
+_ATTN_CP
+_MOE_DP
+_MOE_EP
+_MOE_TP
+_PP
+```
+
+这些服务于 LLM/MoE 推理：TP、PP、attention CP/TP、MoE DP/EP/TP。
+
+### 16.2 multimodal_gen diffusion runtime 里的 group
+
+`multimodal_gen` 是另一套 runtime，面向 diffusion / DiT / VAE 等图像视频生成链路。它的 group 含义是：
+
+```text
+_WORLD:
+  全局 torch distributed world 的 GroupCoordinator 包装。
+
+_TP:
+  Tensor Parallel，切 DiT/模型张量维度。
+
+_SP:
+  Sequence Parallel，切图像/视频 token 序列维度。这里是 SequenceParallelGroupCoordinator，内部还维护 Ulysses/Ring 子组。
+
+_PP:
+  Pipeline Parallel，切 pipeline stage，用 PipelineGroupCoordinator 提供 stage 间通信辅助。
+
+_CFG:
+  Classifier-Free Guidance 并行组。diffusion 里 cond/uncond 两路可以拆到不同 rank 并行算，再合成 guidance。
+
+_DP:
+  Data Parallel，不同 DP rank 跑不同样本/请求副本。
+
+_DIT:
+  DiT 模型裸 ProcessGroup，包含参与 diffusion transformer/DiT denoising 的 ranks。
+
+_VAE:
+  VAE 专用裸 ProcessGroup，用于把 VAE encode/decode 分配到独立 ranks。
+```
+
+简化层级：
+
+```text
+_WORLD
+  ├─ _DIT
+  │   ├─ _DP
+  │   ├─ _CFG
+  │   ├─ _SP
+  │   ├─ _PP
+  │   └─ _TP
+  └─ _VAE
+```
+
+### 16.3 不要把两套 runtime 混读
+
+如果当前目标是走读 SRT LLM 推理链路：
+
+```text
+HTTP/tokenizer -> Scheduler -> TpModelWorker -> ModelRunner -> Detokenizer
+```
+
+优先看：
+
+```text
+python/sglang/srt/distributed/parallel_state.py
+python/sglang/srt/model_executor/model_runner.py
+```
+
+如果目标是 diffusion / image-video generation，才看：
+
+```text
+python/sglang/multimodal_gen/runtime/distributed/parallel_state.py
+```
+
+一句话：
+
+```text
+_SP/_CFG/_DIT/_VAE 和 SRT LLM 推理主线没直接关系；它们属于 multimodal_gen diffusion runtime。
+```
