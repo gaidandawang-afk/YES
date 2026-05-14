@@ -1,639 +1,578 @@
-﻿# SGLang Fault-Tolerance M1-M3 Retry-only Presentation 设计文档
-
-## 0. Presentation 目标
-
-这份文档用于汇报 SGLang 直接实现 M1、M2、M3 fault-tolerance 的详细设计。核心主题是：SGLang 本次不只做软故障 resume，而是实现 same-topology retry，包括通信域 abort/reinit；同时明确不支持 scale_down、rank replacement 和 topology-changing recovery。
-
-建议时长：35 到 50 分钟。
-
-## 1. Slide 1：标题
-
-标题：
+﻿下面给你一版**可直接用于 15–20min 线上英文 presentation 的完整稿**，结构按你确认的方向：
 
 ```text
-SGLang Fault-Tolerance M1-M3 Design
-Same-topology retry with communication-domain rebuild
+Part 1: Why we need this
+Part 2: What abstraction we propose
+Part 3: How we roughly implement it in SGLang
+Part 4: How we split the work into the original 3 RFC milestones
 ```
 
-页面要点：
+我会尽量写成**口语化但正式的社区汇报风格**，不是论文式文本。
 
-- 直接交付 M1、M2、M3。
-- retry 包含 communicator / ProcessGroup rebuild。
-- 不支持 scale_down / rank replacement。
+---
 
-讲稿提示：
+# Presentation Script
 
-> 这版设计的重点是把 retry 做到和 vLLM M1 对齐：不是简单 resume loop，而是故障后停住 runtime、abort 旧通信域，再用相同 topology 重建通信域后恢复。
+## Title
 
-## 2. Slide 2：设计范围变化
+**Internal Process-level Fault Control for SGLang**
 
-标题：
+---
+
+## Opening
+
+Hi everyone, thanks for giving me the time to introduce this RFC.
+
+Today I would like to present our proposal for an internal process-level fault-control framework for SGLang.
+
+The goal of this RFC is not to make SGLang itself a full cluster-level fault-tolerance system. Instead, the goal is more focused: when a fault happens inside the SGLang runtime, the engine should not immediately become a black box or directly exit without giving the upper-layer system a chance to observe and control it.
+
+So the key question we want to answer is:
+
+**How can SGLang expose structured fault state and provide safe control primitives, so that an external serving framework can make the right recovery decision?**
+
+I will cover four parts:
+
+First, why we think this is needed.
+
+Second, what abstraction we propose.
+
+Third, how we roughly implement it inside SGLang.
+
+And finally, how we plan to split the work into milestones.
+
+---
+
+# Part 1: Why We Need This
+
+Large-scale LLM serving is increasingly deployed across multiple physical nodes. This is especially true for large MoE models, where we may use DP, EP, TP, or related parallel strategies to improve throughput.
+
+But this also means the reliability requirement becomes much higher. A local failure, for example a single failed rank, a communication timeout, or a scheduler-side exception, may directly affect the whole serving instance.
+
+Today, there are generally two kinds of behavior.
+
+The first one is fail-stop. When an important process fails, the whole engine exits, and the upper-layer system restarts it.
+
+This is simple and safe, but it is also expensive. The external serving system has very limited visibility into what happened inside the engine. It only knows that the process is gone or unhealthy.
+
+The second one is backend-level fault handling. For example, an FT-enabled backend may detect a failed rank and isolate it from the forward path. This is useful because it can prevent healthy ranks from being blocked forever.
+
+But this also has limitations. If fault handling is embedded directly into the inference workflow, the upper-layer serving system still cannot easily observe the actual engine state or control the recovery process. The engine still behaves like a black box during failures. This limitation is also the motivation stated in the RFC: current fault handling is either direct exit or rank isolation by FT backends, but this does not provide a unified control interface for upper-layer orchestration. ([GitHub][1])
+
+So we believe SGLang needs an engine-level fault-control layer.
+
+The key point is not only to detect a fault. The key point is to make the engine observable and controllable after the fault.
+
+When a fault happens, SGLang should be able to:
+
+stop accepting new normal inference requests,
+
+enter a structured fault state,
+
+keep the management interface available,
+
+expose what happened,
+
+and wait for an explicit instruction, such as pause, retry, scale-down, or terminate.
+
+So the first message of this RFC is:
+
+**Fault tolerance should not only be a data-plane capability. SGLang also needs a control-plane abstraction.**
+
+---
+
+# Part 2: What Abstraction We Propose
+
+The abstraction we propose is to separate fault tolerance into three layers.
+
+The first layer is the **data plane**.
+
+This is where low-level fault detection and communication-level handling happen. For example, FT backends such as Mooncake or NIXL can detect communication timeouts, isolate failed ranks, or maintain an active rank mask.
+
+The second layer is the **SGLang fault-control layer**.
+
+This is what this RFC focuses on. SGLang maintains runtime fault state, aggregates fault signals, exposes status and control APIs, freezes or resumes admission, and executes engine-local control commands.
+
+The third layer is the **decision plane**.
+
+This belongs to the upper-layer serving framework. It has a broader view of the cluster, SLA, multiple engines, node health, and scheduling policy. Therefore, it should decide whether the right action is retry, scale down, restart, replace a rank, or terminate.
+
+This is also the separation described in the RFC: data plane is implemented by FT backends, control plane is implemented by the SGLang FT framework, and decision plane is implemented by the upper-layer serving framework. ([GitHub][1])
+
+The most important design principle is:
+
+**SGLang should provide mechanisms, not hard-code global recovery policies.**
+
+For example, SGLang may expose that rank 3 is unhealthy, the scheduler is paused, and the old communication domain has been aborted. But SGLang should not be the component that decides whether this should be handled by retry, scale-down, or full restart.
+
+That decision requires global context.
+
+So the control flow becomes:
+
+A fault happens.
+
+SGLang brings the engine into a controlled state.
+
+The upper-layer serving framework observes the state.
+
+The upper-layer serving framework sends a recovery instruction.
+
+SGLang executes the instruction safely inside the engine.
+
+In terms of interfaces, we propose two basic APIs.
+
+The first one is:
+
+```http
+GET /fault_tolerance/status
+```
+
+This returns the current engine-level fault state, per-rank or per-component health information, and the latest fault information.
+
+The second one is:
+
+```http
+POST /fault_tolerance/apply
+```
+
+This is used by the upper-layer system to apply a control instruction, such as pause, retry, scale_down, or terminate.
+
+The RFC currently lists status and control interfaces, with example control actions including `pause`, `retry`, and `scale_down`. ([GitHub][1])
+
+So the second message of this RFC is:
+
+**We want to standardize how SGLang reports fault state and how external systems control recovery.**
+
+---
+
+# Part 3: How We Roughly Implement It in SGLang
+
+Now I will talk about the rough implementation inside SGLang.
+
+At a high level, we introduce two core components.
+
+The first component is **SentinelManager**.
+
+It lives in the main process. It owns the global fault-tolerance state machine, controls admission, serves the status and apply APIs, receives fault events, and sends commands to scheduler processes.
+
+The second component is **FaultSentinel**.
+
+Each scheduler process has one local FaultSentinel. It is a lightweight control thread inside the scheduler process. It sends heartbeat to the SentinelManager, reports local faults, receives out-of-band commands, and performs emergency actions such as hard pause or communication abort.
+
+So the layout is:
 
 ```text
-Scope change: from soft resume to retry with comm reinit
+Main Process
+  - HTTP Server
+  - TokenizerManager
+  - SentinelManager
+
+Scheduler Process
+  - Scheduler main loop
+  - ModelRunner / TpModelWorker
+  - FaultSentinel control thread
 ```
 
-对比：
+The implementation spec follows this structure: the main process owns `SentinelManager`, and each scheduler process owns a `FaultSentinel` control thread plus the scheduler main loop wrapper. 
 
-| 旧保守范围 | 新范围 |
-| --- | --- |
-| 只恢复健康暂停的进程 | 恢复通信域被 abort 后的同 topology runtime |
-| 只做 loop resume | 必须重建 communicator / ProcessGroup |
-| 主要复用 pause/continue | pause + hard abort + distributed reinit + continue |
-| DP/TP 多 rank 不承诺 | 支持 required ranks 全存活的 same-topology retry |
-| 后续再做 vLLM M1 能力 | 本次直接做 M1-M3 |
+A natural question is: why do we need a FaultSentinel control thread?
 
-讲稿提示：
+The reason is that fault-control commands cannot depend only on the scheduler main loop.
 
-> 用户期望不是“先做控制面，后面再说通信域”，而是这次直接把 retry 做完整。限制条件是 topology 不变，所有 required rank 都还活着。
+In a normal case, the scheduler loop can process normal pause or continue requests. But in a fault case, the scheduler main loop may be blocked in model forward, collective communication, blocking I/O, or exception handling.
 
-## 3. Slide 3：为什么 retry 必须重建通信域
+If a hard pause command goes through the normal scheduler queue, it may never be processed.
 
-标题：
+So the FaultSentinel provides an out-of-band control path. It is not part of the normal inference data path. Its job is to keep the process controllable even when the main execution path is unhealthy.
+
+However, we also need to be careful about thread safety.
+
+The FaultSentinel should not directly rebuild ModelRunner, rebind process groups, or recapture CUDA graphs. These operations are complex runtime mutations and should happen on the scheduler main thread at a safe point.
+
+So we separate emergency actions from reconstruction.
+
+The FaultSentinel can perform emergency control actions, such as disabling communicators or aborting old communication domains.
+
+But reinitialization, ModelRunner rebind, runtime state cleanup, and graph recapture should be executed by the scheduler main loop when it enters a parked recovery point. This is also explicitly required in the development spec: hard pause and communication abort must use an out-of-band control channel, while reinit, ModelRunner rebind, and CUDA graph recapture should happen in the scheduler main loop at a parked safe point. 
+
+Now let me describe the fault handling path.
+
+When a scheduler-side fault happens, for example a Python exception, communication error, or heartbeat stall, we first wrap it into a structured `FaultEvent`.
+
+At this stage, we do not try to decide whether the fault is recoverable.
+
+The first goal is to bring the engine into a controlled state.
+
+The flow is roughly:
 
 ```text
-Why resume-only retry is unsafe
+scheduler exception / communication failure / heartbeat stall
+    -> FaultEvent
+    -> FaultSentinel reports the event
+    -> SentinelManager enters FAULT_DETECTED
+    -> admission is frozen
+    -> hard pause is sent to scheduler processes
+    -> old communicators are aborted or destroyed
+    -> engine enters COMM_ABORTED or WAITING_OPERATOR
 ```
 
-页面要点：
+The important principle is:
 
-- collective fault 后不同 rank 可能停在不同阶段。
-- 旧 NCCL communicator 可能已 timeout 或半失败。
-- torch ProcessGroup backend 状态可能不一致。
-- CUDA graph 可能捕获了旧 communicator。
-- 继续使用旧通信域会导致 hang、错误结果或二次崩溃。
+**Detection does not imply recoverability.**
 
-图示：
+Detection only means the fault is now under the framework. Whether retry is safe is decided later, based on process liveness, communication cleanup result, reinitialization result, and health check.
+
+This is also the requirement in the spec: scheduler exceptions are first wrapped as `FaultEvent`; they no longer need to be pre-classified as recoverable; recoverability is judged during the recovery phase. 
+
+Next is admission control.
+
+When the engine is in `RUNNING` state, normal inference requests are allowed.
+
+When the engine leaves `RUNNING`, normal inference requests should return a structured 503 response. But management APIs must remain available, including fault status, fault apply, health, metrics, and necessary admin endpoints.
+
+This is important because if the management interface disappears, the upper-layer system cannot observe or recover the engine.
+
+Next is hard pause and communication abort.
+
+A normal pause is not enough for fault recovery. If one rank is blocked in collective communication, simply setting a pause flag may not stop the blocked operation.
+
+Therefore, hard pause should include communication cleanup.
+
+The rough flow is:
 
 ```text
-Rank 0 exits collective     Rank 1 still waiting
-        |                           |
-        v                           v
-old communicator inconsistent / unsafe
-        |
-        v
-must abort + rebuild before retry
+freeze admission
+    -> best-effort normal pause
+    -> broadcast HARD_ABORT_COMM
+    -> local FaultSentinel disables communicators
+    -> abort or destroy old process groups
+    -> enter COMM_ABORTED or WAITING_OPERATOR
 ```
 
-讲稿提示：
+If communication abort fails, we should not silently resume. We should keep the management plane available and expose the failure state.
 
-> 这也是 vLLM M1 做 communicator abort/reinit 的原因。collective 被打断后，安全边界不是 scheduler loop，而是通信域。
+Finally, the retry path.
 
-## 4. Slide 4：当前 SGLang 架构锚点
+The first implementation focuses on same-topology retry. That means we do not change world size or parallel configuration in the first phase.
 
-标题：
+The retry flow is:
 
 ```text
-Where FT hooks into SGLang
+POST /fault_tolerance/apply retry
+    -> SentinelManager validates current state
+    -> prepare retry
+    -> ensure old communication domain is aborted
+    -> send RETRY_REINIT
+    -> scheduler main loop executes recovery at parked safe point
+    -> cleanup scheduler runtime state
+    -> reinit distributed environment
+    -> rebuild process groups
+    -> rebind ModelRunner group-dependent objects
+    -> invalidate or recapture CUDA graphs
+    -> run health collective
+    -> resume scheduler and admission
 ```
 
-Mermaid：
-
-```mermaid
-flowchart LR
-    Client[Client] --> HTTP[HTTP Server]
-    HTTP --> TM[TokenizerManager]
-    TM --> SCH[Scheduler Process]
-    SCH --> TP[TpModelWorker]
-    TP --> MR[ModelRunner]
-    MR --> DIST[Distributed Groups / Communicators]
-    SCH --> DET[DetokenizerManager]
-    DET --> TM
-
-    subgraph Main[Main Process]
-      HTTP
-      TM
-    end
-
-    subgraph Runtime[Runtime Processes]
-      SCH
-      TP
-      MR
-      DIST
-      DET
-    end
-```
-
-页面要点：
+The key point is that retry is conservative. We only resume if the health check succeeds.
 
-- TokenizerManager：冻结入口。
-- Scheduler：暂停 event loop、清理 batch。
-- TpModelWorker/ModelRunner：通信域和 CUDA graph 恢复核心。
-- Distributed parallel_state：group destroy/reinit 基础。
+Also, we should be conservative about in-flight requests. Requests that are safe to recompute can be retracted or retried. Requests that have already emitted partial streaming output should not be silently continued as if nothing happened. They should be marked interrupted or handled by the upper-layer retry policy.
 
-讲稿提示：
+The development spec also lists the runtime state that must be cleaned before retry, including running batch, batch queue, overlap scheduling state, chunked request state, unsafe forward state, KV cache blocks, and partial streaming output state. 
 
-> FT 不能只放在 HTTP 层。M2/M3 必须进入 scheduler 和 ModelRunner，因为通信域、CUDA graph、KV/batch 状态都在那里。
+So the third message of this RFC is:
 
-## 5. Slide 5：vLLM M1 参考
+**The implementation is designed to keep the engine controllable during faults, while keeping unsafe runtime reconstruction on the scheduler main thread.**
 
-标题：
+---
 
-```text
-vLLM M1 reference flow
-```
+# Part 4: Milestones and Landing Plan
 
-Mermaid：
+Now I will describe how we propose to land this work.
 
-```mermaid
-flowchart LR
-    Fault[EngineCore fault] --> ECS[EngineCoreSentinel]
-    ECS --> CS[ClientSentinel]
-    CS --> Pause[pause engines]
-    Pause --> WS[WorkerSentinel]
-    WS --> Abort[abort NCCL / ProcessGroup]
-    CS --> API[/status and /apply/]
-    API --> Retry[retry]
-    Retry --> Reinit[distributed reinit]
-    Reinit --> Resume[busy loop resumes]
-```
+Instead of submitting a big-bang fault-tolerance system, we plan to split it into the three milestones described in the RFC.
 
-页面要点：
-
-- `ClientSentinel` 聚合状态。
-- `EngineCoreSentinel` 控制 engine loop。
-- `WorkerSentinel` abort/reinit communicator。
-- retry 不是简单 continue。
+## Milestone 1: Fault Reporting
 
-讲稿提示：
+The first milestone is fault reporting.
 
-> SGLang 不照搬 vLLM 类结构，但要对齐这个语义闭环。
+The goal is that when a failure happens in an inference-related component, SGLang does not immediately exit when fault tolerance is enabled. Instead, the runtime stays alive for a configurable timeout window and exposes internal fault state through newly introduced APIs.
 
-## 6. Slide 6：SGLang M1-M3 总体架构
+This allows the upper-layer serving framework to observe the failure and coordinate the next step.
 
-标题：
+In this milestone, we mainly need:
 
-```text
-SGLang FT architecture for M1-M3
-```
+the FT configuration flag,
 
-Mermaid：
+the state model,
 
-```mermaid
-flowchart LR
-    Client[Client] --> MW[FT Middleware]
-    MW --> HTTP[HTTP APIs]
-    HTTP --> FC[FaultCoordinator]
-    FC --> Store[FaultStateStore]
-    FC --> TM[TokenizerManager]
-    TM --> SCH[SchedulerFaultAgent]
-    SCH --> RA[RankFaultAgent]
-    RA --> DRM[DistributedRecoveryManager]
-    DRM --> Groups[ProcessGroups / Communicators]
-    DRM --> MR[ModelRunner]
-
-    SCH -- FaultReportOutput --> TM
-    TM -- report_fault --> FC
-    FC -- pause / hard_abort / retry --> SCH
-```
+the `FaultEvent` structure,
 
-组件职责：
+the `SentinelManager` skeleton,
 
-- `FaultCoordinator`：状态机、API、聚合结果。
-- `SchedulerFaultAgent`：捕获 recoverable fault、暂停 scheduler、转发 rank command。
-- `RankFaultAgent`：本 rank pause/abort/retry/health check。
-- `DistributedRecoveryManager`：abort/reinit/rebind/graph recapture。
+the status API,
 
-讲稿提示：
+basic fault recording,
 
-> 相比旧方案，新增的关键组件是 RankFaultAgent 和 DistributedRecoveryManager。它们让 retry 能处理通信域重建。
+and tests for state transition and fault event idempotency.
 
-## 7. Slide 7：Milestone 定义
+The key value of this milestone is that it introduces observability without changing recovery behavior too much.
 
-标题：
+It also gives the community a chance to review the API shape and the state model early.
 
-```text
-M1, M2, M3 deliverables
-```
+The RFC defines Milestone 1 exactly in this direction: after a failure, the runtime no longer exits immediately, but stays alive for a configurable timeout window and exposes internal fault state through APIs. ([GitHub][1])
 
-表格：
+## Milestone 2: Pause-on-error
 
-| Milestone | 交付内容 |
-| --- | --- |
-| M1 | status/apply API、middleware、FaultCoordinator、状态机、manual pause/retry/terminate。 |
-| M2 | fault report、scheduler pause、rank command、hard abort communicator/process group、unsafe batch cleanup。 |
-| M3 | same-topology distributed reinit、group rebind、CUDA graph invalidation/recapture、health check、resume scheduler。 |
+The second milestone is pause-on-error.
 
-讲稿提示：
+Once a fault is reported, healthy components should not continue running blindly. Otherwise, we may get cascading failures, blocked collectives, or corrupted runtime state.
 
-> 这次不是三阶段规划，而是三块都进入本次实现范围。PR 可以分阶段提交，但最终验收覆盖 M1-M3。
+So in this milestone, we introduce the pause instruction and the out-of-band control path.
 
-## 8. Slide 8：状态机
+The SentinelManager freezes admission and broadcasts pause to local FaultSentinels.
 
-标题：
+Each FaultSentinel sets local pause state and helps stop the workflow in a controlled way.
 
-```text
-State machine with communication abort
-```
+For hard pause, we also need communication cleanup, including communicator disable, abort, or process group destroy.
 
-Mermaid：
+This milestone makes the engine controllable after fault detection.
 
-```mermaid
-stateDiagram-v2
-    [*] --> RUNNING
-    RUNNING --> FAULT_DETECTED: recoverable/communication fault
-    RUNNING --> PAUSING: manual pause
-    FAULT_DETECTED --> PAUSING: freeze admission
-    PAUSING --> ABORTING_COMM: hard pause
-    PAUSING --> PAUSED: soft pause
-    ABORTING_COMM --> COMM_ABORTED: abort success
-    ABORTING_COMM --> TERMINATING: abort failure
-    PAUSED --> RECOVERING: retry
-    COMM_ABORTED --> RECOVERING: retry
-    RECOVERING --> RUNNING: reinit + health check success
-    RECOVERING --> COMM_ABORTED: retry failure keep alive
-    RECOVERING --> TERMINATING: retry failure shutdown
-```
+The RFC describes this milestone as introducing a `Pause` instruction to suspend healthy ranks when one rank fails, so that cascading failures can be prevented. Sentinels set a pause flag, and key components such as scheduler and model runner check this flag to halt the workflow in a controlled manner. ([GitHub][1])
 
-状态要点：
+In implementation, we will be conservative.
 
-- `COMM_ABORTED` 是 retry 前的关键安全点。
-- `RECOVERING` 期间普通请求仍 503。
-- retry 成功前不能打开 admission gate。
+The FaultSentinel can handle emergency control actions.
 
-## 9. Slide 9：M1 控制面
+But it will not directly mutate complex runtime objects like ModelRunner or CUDA graphs.
 
-标题：
+Those operations remain on the scheduler main thread.
 
-```text
-M1: control plane
-```
-
-页面要点：
-
-- `GET /fault_tolerance/status`。
-- `POST /fault_tolerance/apply`。
-- `FaultCoordinator` 串行化 pause/retry/terminate。
-- Middleware 在非 RUNNING 返回 503。
-- scale_down 请求直接 unsupported。
+## Milestone 3: Fault Handling Interface
 
-API 示例：
+The third milestone is the fault handling interface.
 
-```json
-{
-  "fault_tolerance_instruction": "retry",
-  "fault_tolerance_timeout": 60,
-  "fault_tolerance_params": {
-    "reinit_distributed": true,
-    "clear_running_batch": true,
-    "recapture_cuda_graph": true
-  }
-}
-```
+Based on fault reporting and pause-on-error, the upper-layer serving framework can choose a recovery strategy.
 
-讲稿提示：
+The first strategy we plan to support is same-topology retry.
 
-> M1 是对外协议。上层平台只需要知道 status 和 apply，不需要了解 scheduler 或 communicator 细节。
+This includes:
 
-## 10. Slide 10：M2 hard pause
+validating the current state,
 
-标题：
+cleaning old communication domains,
 
-```text
-M2: pause and hard-abort communication domain
-```
+cleaning unsafe scheduler runtime state,
 
-Mermaid：
+reinitializing distributed environment with the same topology,
 
-```mermaid
-sequenceDiagram
-    participant F as FaultCoordinator
-    participant T as TokenizerManager
-    participant S as SchedulerFaultAgent
-    participant R as RankFaultAgent
-    participant D as DistributedRecoveryManager
+rebinding ModelRunner and group-dependent objects,
 
-    F->>T: freeze admission
-    F->>S: PauseGenerationReqInput(mode=retract)
-    S->>S: set _engine_paused = true
-    S->>S: cleanup running batch / batch queue
-    F->>S: HARD_ABORT_COMM
-    S->>R: hard_abort_comm
-    R->>D: abort_communicators
-    D->>D: ncclCommAbort / ProcessGroup abort or destroy
-    D->>D: cleanup_dist_env_and_memory
-    R-->>S: COMM_ABORTED
-    S-->>F: COMM_ABORTED
-```
+invalidating or recapturing CUDA graphs,
 
-页面要点：
+running a health collective,
 
-- `retract` 是默认 scheduler pause mode。
-- hard pause 要 disable + abort communicators。
-- abort 成功后才允许 retry。
+and resuming admission only after success.
 
-讲稿提示：
+In the future, the same interface can support scale-down or other recovery actions. But we do not need to solve all of them in the first implementation.
 
-> M2 的产物不是 RUNNING，而是一个可恢复的静止点：请求入口冻结、scheduler 停住、旧通信域已被拆掉。
+The RFC defines Milestone 3 as adding the fault handling interface, so that the upper-layer serving framework can choose recovery strategies such as retry and scale_down, and the runtime can restore context or isolate failed components if needed. ([GitHub][1])
 
-## 11. Slide 11：M3 retry
+So the landing plan is:
 
-标题：
+Milestone 1 gives observability.
 
-```text
-M3: same-topology retry
-```
+Milestone 2 gives controlled pause.
 
-Mermaid：
+Milestone 3 gives recovery command execution.
 
-```mermaid
-sequenceDiagram
-    participant O as Serving Platform
-    participant F as FaultCoordinator
-    participant S as SchedulerFaultAgent
-    participant R as RankFaultAgent
-    participant D as DistributedRecoveryManager
-    participant M as ModelRunner
+And all of this should be disabled by default, so existing SGLang behavior remains unchanged unless users explicitly enable the feature.
 
-    O->>F: POST /fault_tolerance/apply retry
-    F->>F: validate no scale_down / all ranks alive
-    F->>S: RETRY_REINIT
-    S->>R: retry_reinit
-    R->>D: reinit_distributed
-    D->>D: init_distributed_environment
-    D->>D: initialize_model_parallel / initialize_dp_attention
-    D->>M: rebind groups
-    D->>M: invalidate and recapture CUDA graphs
-    D->>D: health collective
-    R-->>S: success
-    S-->>F: success
-    F->>S: continue_generation
-    F->>F: state RUNNING
-```
+---
 
-讲稿提示：
+# Closing
 
-> retry 只允许相同 topology。所有 rank 必须还在，rank id 和 world size 不变；只允许换 rendezvous endpoint 和 communicator 实例。
+To summarize:
 
-## 12. Slide 12：Same-topology only
+This RFC is not trying to make SGLang a full cluster-level fault-tolerance decision system.
 
-标题：
+Instead, it adds an engine-level fault-control layer.
 
-```text
-What retry supports and rejects
-```
+The data plane detects or reports faults.
 
-支持：
+SGLang maintains structured state and executes engine-local commands.
 
-- 所有 required rank 仍存活。
-- world size 不变。
-- rank mapping 不变。
-- DP/TP/PP/EP/CP group 划分不变。
-- 新端口或新 rendezvous endpoint。
-- communicator / ProcessGroup / CUDA graph 重建。
+The upper-layer serving framework makes the recovery decision.
 
-拒绝：
+The first implementation focuses on three incremental milestones:
 
-- `scale_down`。
-- rank replacement。
-- 节点永久丢失。
-- DP size 变化。
-- expert 迁移。
-- 进程死亡后的 in-place retry。
+fault reporting,
 
-讲稿提示：
+pause-on-error,
 
-> 这是本次最重要的边界。retry 是“同一批 rank 重新建连”，不是“少一个 rank 继续跑”。
+and fault handling interface.
 
-## 13. Slide 13：通信域恢复细节
+We believe this gives SGLang a clean and extensible foundation for future fault tolerance, while keeping the initial implementation incremental, opt-in, and reviewable.
 
-标题：
+What we would like to get from the community today is feedback on three things:
 
-```text
-Communication-domain lifecycle
-```
+First, whether this abstraction boundary is acceptable.
 
-页面要点：
+Second, whether the proposed status and control APIs are the right interface for upper-layer orchestration.
 
-1. Disable communicator，阻止新 collective。
-2. Abort PyNccl communicator：新增 `ncclCommAbort` wrapper。
-3. Abort 或 destroy torch ProcessGroup backend。
-4. Destroy model parallel groups 和 world group。
-5. Reinit distributed env。
-6. Recreate TP/PP/DP/EP/attention/MoE groups。
-7. Rebind model-side group references。
-8. Health collective。
+And third, whether the three milestone plan is a reasonable way to land this feature incrementally.
 
-讲稿提示：
+Thank you.
 
-> SGLang 已经有 destroy_model_parallel、destroy_distributed_environment 和 cleanup_dist_env_and_memory，缺口主要是 abort 能力、group 枚举、ModelRunner rebind 和 graph invalidation。
+---
 
-## 14. Slide 14：CUDA graph 和 batch state
+# 10 Key Q&A
 
-标题：
+## Q1: Why should this logic live inside SGLang instead of only in the serving platform?
 
-```text
-Graph and batch state cannot be reused blindly
-```
+**Answer:**
 
-页面要点：
+The serving platform should make the recovery decision, but it cannot safely perform engine-local operations from outside the process.
 
-- old CUDA graph 可能捕获旧 communicator。
-- fault iteration 可能已经部分写 KV。
-- streaming 请求可能已输出部分 token。
-- running batch / batch queue / chunked req 需要清理或 retract。
-- graph 必须 invalidated，恢复后 recapture 或临时禁用。
+For example, freezing admission, pausing scheduler workflow, aborting old communicators, rebuilding process groups, rebinding ModelRunner objects, and invalidating CUDA graphs are all runtime-internal operations.
 
-推荐策略：
+So the split is:
 
-```text
-auto fault pause = retract + hard abort
-retry = clear unsafe batch + reinit + recapture + health check
-```
+SGLang provides engine-local mechanisms.
 
-讲稿提示：
+The serving platform provides global recovery policy.
 
-> 通信域恢复只是必要条件，不是充分条件。batch、KV 和 CUDA graph 也要回到可信状态。
+That is exactly the abstraction we propose.
 
-## 15. Slide 15：故障分类
+---
 
-标题：
+## Q2: Is this duplicating FT backends such as Mooncake or NIXL?
 
-```text
-Fault classes
-```
+**Answer:**
 
-表格：
+No. FT backends and this RFC work at different layers.
 
-| 故障 | 行为 |
-| --- | --- |
-| `RecoverableFault` | hard pause + retry。 |
-| communication timeout 且 rank 响应 | abort comm + retry。 |
-| manual hard pause | abort comm，等待 retry。 |
-| unknown Python exception | fail-stop。 |
-| scheduler/detokenizer 进程退出 | fail-stop。 |
-| CUDA context fatal | fail-stop。 |
-| rank 永久丢失 | retry 失败；scale_down unsupported。 |
-| scale_down 指令 | 400 unsupported。 |
+FT backends are data-plane components. They can detect low-level communication failures and may isolate failed ranks.
 
-讲稿提示：
+This RFC adds the control plane above that. It aggregates fault signals, exposes engine state, freezes admission, and executes explicit recovery commands.
 
-> 不要把所有异常都包进 FT。只有进程仍活着、rank 还能响应 command、topology 不变的场景才进入 retry。
+So we are not replacing FT backends. We are making their fault signals observable and controllable at the engine level.
 
-## 16. Slide 16：测试计划
+---
 
-标题：
+## Q3: Why not just fail-stop and let Kubernetes or another supervisor restart the engine?
 
-```text
-Validation plan
-```
+**Answer:**
 
-测试分层：
+Fail-stop should remain the default and the safest fallback.
 
-1. State/coordinator/middleware 单测。
-2. rank agent command 聚合测试。
-3. fake communicator abort/reinit mock 测试。
-4. TP=2 GPU 集成：fault -> abort -> retry -> all_reduce success。
-5. DP>1 same-size retry：新 endpoint reinit。
-6. CUDA graph enabled：旧 graph invalidated，retry 后 recapture。
-7. rank exit：retry fail，scale_down unsupported。
-8. FT disabled 回归。
+But it is not always the cheapest recovery path.
 
-验收句：
+For some failures, such as transient communication issues or recoverable scheduler-side failures, the process may still be alive and controllable. In those cases, a controlled pause and same-topology retry may recover faster than a full restart.
 
-```text
-retry success means new communication domain passes health collective and normal inference resumes.
-```
+This RFC does not remove restart. It adds another option before restart.
 
-## 17. Slide 17：PR 拆分
+---
 
-标题：
+## Q4: Why do we need a FaultSentinel thread? Why not use the scheduler loop?
 
-```text
-Implementation plan
-```
+**Answer:**
 
-表格：
+Because in a fault case, the scheduler loop may be exactly the component that is blocked.
 
-| PR | 内容 |
-| --- | --- |
-| PR1 | M1 控制面：配置、state、coordinator、API、middleware。 |
-| PR2 | M2 command：scheduler fault report、rank agent、command result。 |
-| PR3 | M2 abort：PyNccl abort、ProcessGroup abort/destroy、cleanup。 |
-| PR4 | M3 reinit：same-topology distributed/model-parallel reinit。 |
-| PR5 | M3 safety：batch cleanup、group rebind、CUDA graph recapture。 |
-| PR6 | E2E tests、文档、平台对接。 |
+It may be blocked in model forward, collective communication, blocking I/O, or exception handling.
 
-讲稿提示：
+If hard pause depends on the normal scheduler queue, the command may never be processed.
 
-> 虽然按 PR 拆分，但最终交付范围包含 M1-M3；不是只做 PR1 就算完成。
+The FaultSentinel gives us an out-of-band control path, so the process remains controllable even when the main execution path is unhealthy.
 
-## 18. Slide 18：风险
+---
 
-标题：
+## Q5: Is it safe to abort communicators from a separate thread?
 
-```text
-Risks and mitigations
-```
+**Answer:**
 
-风险：
+This is one of the sensitive parts, so the design is conservative.
 
-- PyTorch backend abort API 版本差异。
-- SGLang PyNccl wrapper 当前缺少 `ncclCommAbort`。
-- ModelRunner 内部 group references 分散。
-- CUDA graph 捕获通信算子后必须全量 invalidation。
-- streaming 输出已经部分返回，不能透明续接。
-- MoE/EP/DP 复杂 topology 下 same-topology reinit 需要更多集成测试。
+The FaultSentinel thread is only allowed to perform emergency control actions, such as disabling or aborting communicators with timeout.
 
-缓解：
+It should not rebuild ModelRunner, mutate scheduler runtime state, or recapture CUDA graphs.
 
-- abort 不可用时 fallback destroy。
-- retry 前 required rank health check。
-- retry 后 collective health check。
-- 不能 rebind 的对象直接 fail retry。
-- 默认 `shutdown_on_fault_tolerance_failure=True`。
+Those operations are executed later by the scheduler main thread at a parked safe point.
 
-## 19. Slide 19：结论
+If communication cleanup fails, we do not resume. We keep the engine in a controlled fault state and expose the failure through the status API.
 
-标题：
+---
 
-```text
-Conclusion
-```
+## Q6: How do you decide whether a fault is recoverable?
 
-页面要点：
+**Answer:**
 
-- 本次 SGLang FT 直接实现 M1-M3。
-- retry 包含通信域重建，不是单纯 continue。
-- 支持 same-topology retry。
-- 不支持 scale_down、rank replacement、world size 变化。
-- 成功标准是：fault 后 hard pause，retry 后新通信域通过 health check，推理恢复。
+We do not decide that at detection time.
 
-收尾话术：
+At detection time, all scheduler-side faults are first wrapped into structured `FaultEvent`s and brought into the framework.
 
-> 这版设计把 SGLang 的 fault-tolerance 从“可暂停”推进到“可同拓扑恢复”。它不解决节点永久丢失，但能覆盖进程仍存活、通信域需要重建的 retry 场景。
+Recoverability is judged later during recovery, based on whether the relevant processes are alive, whether old communicators can be cleaned up, whether distributed reinit succeeds, and whether the health collective passes.
 
-## 20. 附录 A：API 示例
+So detection and recovery are intentionally separated.
 
-查询状态：
+---
 
-```bash
-curl http://127.0.0.1:30000/fault_tolerance/status
-```
+## Q7: What happens to in-flight requests when a fault happens?
 
-hard pause：
+**Answer:**
 
-```bash
-curl -X POST http://127.0.0.1:30000/fault_tolerance/apply \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "fault_tolerance_instruction": "pause",
-    "fault_tolerance_timeout": 30,
-    "fault_tolerance_params": {"mode": "retract", "hard": true}
-  }'
-```
+We should be conservative.
 
-retry：
+The first goal is to recover engine availability, not to guarantee transparent continuation for every in-flight request.
 
-```bash
-curl -X POST http://127.0.0.1:30000/fault_tolerance/apply \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "fault_tolerance_instruction": "retry",
-    "fault_tolerance_timeout": 60,
-    "fault_tolerance_params": {
-      "reinit_distributed": true,
-      "clear_running_batch": true,
-      "recapture_cuda_graph": true
-    }
-  }'
-```
+Requests that can be safely retracted or recomputed may be retried.
 
-scale_down unsupported：
+Requests that have already emitted partial streaming output should not be silently continued as if nothing happened. They should be marked interrupted or handled by the upper-layer retry policy.
 
-```bash
-curl -X POST http://127.0.0.1:30000/fault_tolerance/apply \
-  -H 'Content-Type: application/json' \
-  -d '{"fault_tolerance_instruction": "scale_down"}'
-```
+This avoids correctness issues caused by inconsistent runtime state after a fault.
 
-预期返回：
+---
 
-```json
-{
-  "success": false,
-  "error": "scale_down is not supported by SGLang FT retry-only mode"
-}
-```
+## Q8: Why is the first recovery target same-topology retry instead of scale-down?
 
-## 21. 附录 B：Q&A
+**Answer:**
 
-### Q1：为什么 M1-M3 必须重建通信域？
+Same-topology retry is the smallest complete recovery loop.
 
-collective fault 后旧 communicator 和 process group 可能处于不一致状态，resume loop 不足以保证安全。必须 abort/destroy 后重建。
+It validates the whole framework: fault reporting, admission freeze, pause, communication cleanup, distributed reinit, health check, and resume.
 
-### Q2：这是否等于支持 scale_down？
+Scale-down is important, but it requires topology change, rank isolation semantics, request redistribution, and possibly expert migration.
 
-不是。retry 要求所有 required rank 仍存活，world size 和 rank mapping 不变。少 rank 继续跑属于 scale_down，本次不支持。
+So we propose to first land same-topology retry, then reuse the same control framework for scale-down later.
 
-### Q3：能恢复 GPU fatal 吗？
+---
 
-不能。CUDA context fatal、device lost、segfault、进程死亡仍 fail-stop。
+## Q9: What happens if retry fails?
 
-### Q4：为什么要处理 CUDA graph？
+**Answer:**
 
-如果 CUDA graph 捕获了 collective 或 communicator，旧 graph 可能引用已 abort 的 communicator。retry 后必须 invalidate/recapture。
+Retry failure should not make the management plane disappear.
 
-### Q5：和 vLLM 的差别是什么？
+If retry fails, the engine should stay in a structured fault state, such as `COMM_ABORTED` or `WAITING_OPERATOR`.
 
-语义对齐 vLLM M1：hard pause、abort comm、retry reinit。实现上适配 SGLang：用 `FaultCoordinator`、`SchedulerFaultAgent`、`RankFaultAgent`、`DistributedRecoveryManager`，而不是照搬 vLLM sentinel 类。
+The status API should expose which stage failed, which component or rank failed, and the error summary.
+
+Then the upper-layer serving framework can decide whether to terminate, restart, or apply another recovery strategy.
+
+---
+
+## Q10: How do we avoid making SGLang too complex?
+
+**Answer:**
+
+We control complexity in three ways.
+
+First, the feature is disabled by default, so existing behavior remains unchanged.
+
+Second, the work is split into three milestones: fault reporting, pause-on-error, and fault handling interface.
+
+Third, the abstraction keeps policy outside SGLang. SGLang only provides engine-local mechanisms and APIs.
+
+This makes the design incremental, reviewable, and extensible.
+
+[1]: https://github.com/sgl-project/sglang/issues/22344 "[RFC]: Internal Process-level Fault Tolerance for SGLang · Issue #22344 · sgl-project/sglang · GitHub"
