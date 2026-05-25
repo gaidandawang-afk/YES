@@ -7,6 +7,8 @@
 - 对外接口：`GET /fault_tolerance/status` 和 `POST /fault_tolerance/apply`。
 - 对外动作：`retry`、`scale_down`。
 - 内部能力：pause-on-error。发生故障后 SGLang 可以自动暂停并等待上层服务决策，但不提供 FT 专用的外部 pause instruction。
+- 实现基线：v2 应从去掉 v1 提交 `8a6c8d74`、`03034c16` 的 clean main 设计和开发；v1 代码只作为参考，不作为实现基线。
+- 首个社区 PR 目标：生产代码新增尽量控制在 1000 行以内，避免一次性引入 v1 风格的大型 FT 子系统。
 
 ## 1. 背景和角色分工
 
@@ -17,8 +19,8 @@ SGLang 在容错场景下默认运行在上层服务框架内。上层服务框�
 | 组件 | 职责 |
 | --- | --- |
 | 上层服务框架 | 监控 status，决定调用 `retry` 或 `scale_down`，处理客户端请求重放和实例级流量切换。 |
-| SGLang FT 控制面 | 捕获故障，更新 rank 状态，执行 pause-on-error，分发 retry/scale_down 命令。 |
-| Scheduler/FaultSentinel | 在 scheduler 进程内接收控制命令，清理运行时状态，触发通信域重建。 |
+| SGLang FT 控制面 | 捕获故障，更新 rank 状态，执行 pause-on-error，分发 retry/scale_down 控制请求。 |
+| Scheduler/控制请求处理 | 在 scheduler 进程内接收恢复命令，清理运行时状态，触发通信域恢复或 active-rank 隔离。 |
 | 通信后端 | 提供通信域 abort、reinit、active-rank 隔离或 fault-tolerant continue 能力。 |
 
 ## 2. 需求范围
@@ -39,13 +41,14 @@ SGLang 在容错场景下默认运行在上层服务框架内。上层服务框�
 以下能力不作为 SGLang FT 对外语义的一部分：
 
 - FT 专用外部 pause instruction。
+- v1 风格的外部 pause/retry/terminate 状态机。
 - 上层请求重放。
 - 跨实例请求迁移。
 - 替换 dead rank 并恢复到原 world。
 - 持久化 in-flight 请求状态。
 - 在 status 中暴露复杂阶段、traceback、topology、epoch 或内部 command 结果。
 
-现有非 FT 的 `/pause_generation` 和 `/continue_generation` 属于已有管理接口，不作为本文档定义的 FT 控制面。
+现有非 FT 的 `/pause_generation` 和 `/continue_generation` 属于已有管理接口，不作为本文档定义的 FT 控制面。v2 实现可以在内部复用其 pause gate 和 scheduler 暂停能力，但不把它们暴露为 FT instruction。
 
 ## 3. Rank 状态模型
 
@@ -61,7 +64,7 @@ SGLang 在容错场景下默认运行在上层服务框架内。上层服务框�
 
 1. FT 启动成功后，所有 rank 初始为 `healthy`。
 2. pause-on-error 策略下，故障后仍可控的 rank 进入 `paused`。
-3. 进程退出、heartbeat 不可达、控制面不可达或被 `scale_down` 指定隔离的 rank 进入 `dead`。
+3. 进程退出、控制面不可达或被 `scale_down` 指定隔离的 rank 进入 `dead`。
 4. `retry` 成功后，参与恢复的 rank 进入 `healthy`。
 5. `scale_down` 成功后，未隔离 rank 进入 `healthy`，被隔离 rank 保持 `dead`。
 
@@ -347,3 +350,5 @@ SGLang FT 控制普通推理入口：
 ## 13. 结论
 
 SGLang FT v2 对外提供简洁的 rank 状态查询和两个恢复动作：`retry` 与 `scale_down`。故障后的暂停是内部 pause-on-error 行为，由上层服务框架根据 status 决定后续恢复路径。对 mooncake/nixl 等可续推 backend，通过 `fault_tolerance_on_error_strategy` 明确选择故障后暂停或继续服务。
+
+v2 的开发路径应从 clean main 重新设计，避免把 v1 的大型 sentinel 注册和恢复状态机作为实现前提。
