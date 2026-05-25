@@ -1,0 +1,12 @@
+source /root/autodl-tmp/public/iws/scripts/env-sglang-cu130.sh
+cd "$PROJECT_ROOT" || true
+
+echo "Entered SGLang cu130 environment"
+echo "Project: $PROJECT_ROOT"
+echo "Python: $(command -v python)"
+echo "Model: $MODEL_PATH"
+echo "Default port: $SGLANG_PORT"
+echo
+echo "Now run SGLang directly, for example:"
+echo "  python -m sglang.launch_server --model-path \"\$MODEL_PATH\" --host \"\$SGLANG_HOST\" --port \"\$SGLANG_PORT\" --dp-size 2"
+echo

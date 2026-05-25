@@ -1,0 +1,2 @@
+登陆指令：ssh -p 38651 root@region-42.seetacloud.com
+密码：HA4Q+ZGTema9
